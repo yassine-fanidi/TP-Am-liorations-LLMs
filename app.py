@@ -7,12 +7,19 @@ import pandas as pd
 import streamlit as st
 import ollama
 
+from monitor import ResourceSampler, hardware_info, memoire_modele, snapshot
+
 # Définir le titre de l'application
 st.title("ENSET Chatbot")
 
 MODE_CONV = "💬 Conversation"
 MODE_COMP = "⚖️ Comparaison des modèles"
 available_models = ["llama3.2", "qwen:0.5b"]  # Liste des modèles disponibles
+
+COLS_PERF = ["Modèle", "Temps total (s)", "TTFT (s)", "Tokens générés", "Vitesse (tok/s)",
+             "Chargement modèle (s)", "Fin de génération"]
+COLS_RES = ["Modèle", "CPU moy. (%)", "CPU max (%)", "RAM max (%)", "RAM utilisée max (Go)",
+            "Mémoire du modèle (Mo)", "dont GPU (Mo)", "GPU moy. (%)", "GPU mémoire max (Mo)"]
 
 
 # ───────── AMÉLIORATION 3 : génération en streaming avec mesure des performances ─────────
@@ -25,31 +32,38 @@ def lire(obj, cle, defaut=None):
     return getattr(obj, cle, defaut)
 
 
-def generer(modele, messages, options, message_placeholder):
+def generer(modele, messages, options, message_placeholder, zone_res=None):
     """Appelle le modèle en streaming, affiche la réponse au fil de l'eau.
 
-    Retourne (réponse, métriques).
+    Retourne (réponse, métriques). Pendant la génération, un échantillonneur relève
+    CPU / RAM / GPU en tâche de fond (Amélioration 4) ; zone_res les affiche en direct.
     """
-    full_response, ttft, final, nb_morceaux = "", None, None, 0
+    full_response, ttft, final, nb_morceaux, derniere_maj = "", None, None, 0, 0.0
 
     debut = time.perf_counter()
-    for response in ollama.chat(
-        model=modele,
-        messages=[{'role': m['role'], 'content': m['content']} for m in messages],
-        options=options,
-        stream=True
-    ):
-        texte = lire(lire(response, 'message'), 'content', '') or ''
-        if texte:
-            nb_morceaux += 1
-            if ttft is None:
-                ttft = time.perf_counter() - debut      # temps jusqu'au 1er token
-            full_response += texte
-            message_placeholder.markdown(full_response + "▌")
-        if lire(response, 'done'):
-            final = response                             # dernier message : contient les statistiques
+    with ResourceSampler() as echantillonneur:
+        for response in ollama.chat(
+            model=modele,
+            messages=[{'role': m['role'], 'content': m['content']} for m in messages],
+            options=options,
+            stream=True
+        ):
+            texte = lire(lire(response, 'message'), 'content', '') or ''
+            if texte:
+                nb_morceaux += 1
+                if ttft is None:
+                    ttft = time.perf_counter() - debut      # temps jusqu'au 1er token
+                full_response += texte
+                message_placeholder.markdown(full_response + "▌")
+            if lire(response, 'done'):
+                final = response                             # dernier message : contient les statistiques
+            if zone_res is not None and time.perf_counter() - derniere_maj > 0.5:
+                derniere_maj = time.perf_counter()
+                zone_res.caption(legende_direct(echantillonneur.dernier()))
     duree = time.perf_counter() - debut
     message_placeholder.markdown(full_response)
+    if zone_res is not None:
+        zone_res.empty()
 
     tokens = lire(final, 'eval_count') or nb_morceaux
     duree_gen_ns = lire(final, 'eval_duration') or 0
@@ -57,6 +71,7 @@ def generer(modele, messages, options, message_placeholder):
     # vitesse de génération = tokens / durée de génération mesurée par Ollama
     vitesse = tokens / (duree_gen_ns / 1e9) if duree_gen_ns else (tokens / duree if duree else 0.0)
     raison = lire(final, 'done_reason')
+    taille_mo, vram_mo = memoire_modele(modele)  # mémoire réellement occupée par le modèle (API Ollama)
 
     metriques = {
         "Modèle": modele,
@@ -66,6 +81,9 @@ def generer(modele, messages, options, message_placeholder):
         "Vitesse (tok/s)": round(vitesse, 2),
         "Chargement modèle (s)": round(charge_ns / 1e9, 3),
         "Fin de génération": "tronquée (limite de tokens)" if raison == "length" else "terminée",
+        **echantillonneur.resume(),                          # CPU, RAM, GPU
+        "Mémoire du modèle (Mo)": taille_mo,
+        "dont GPU (Mo)": vram_mo,
     }
     return full_response, metriques
 
@@ -77,8 +95,20 @@ def fmt(x, spec="{:.1f}"):
 def legende_metriques(m):
     """Ligne de mesures affichée sous une réponse."""
     fin = " · ⚠️ tronquée" if m["Fin de génération"].startswith("tronquée") else ""
+    res = (f" · CPU {fmt(m.get('CPU moy. (%)'), '{:.0f}')} % · RAM {fmt(m.get('RAM max (%)'), '{:.0f}')} %"
+           f" · modèle {fmt(m.get('Mémoire du modèle (Mo)'), '{:.0f}')} Mo")
+    if m.get("GPU moy. (%)") is not None:
+        res += f" · GPU {fmt(m['GPU moy. (%)'], '{:.0f}')} %"
     return (f"⏱️ {fmt(m['Temps total (s)'])} s · TTFT {fmt(m['TTFT (s)'], '{:.2f}')} s · "
-            f"{m['Tokens générés']} tokens · {fmt(m['Vitesse (tok/s)'])} tok/s{fin}")
+            f"{m['Tokens générés']} tokens · {fmt(m['Vitesse (tok/s)'])} tok/s{fin}{res}")
+
+
+def legende_direct(s):
+    """Ligne affichée en direct pendant la génération."""
+    if s is None:
+        return "🖥️ mesure en cours…"
+    gpu = f" · GPU {s['gpu_util']:.0f} %" if s["gpu_util"] is not None else ""
+    return f"🖥️ CPU {s['cpu']:.0f} % · RAM {s['ram_pct']:.0f} % ({s['ram_gb']:.1f} Go){gpu}"
 
 
 def enregistrer_mesure(mode, question, metriques):
@@ -87,15 +117,49 @@ def enregistrer_mesure(mode, question, metriques):
 
 
 def afficher_metriques(liste_metriques):
-    """Tableau comparatif + graphiques."""
+    """Tableaux comparatifs + graphiques (performances et ressources)."""
     df = pd.DataFrame(liste_metriques)
     st.markdown("#### 📊 Tableau comparatif des performances")
-    st.dataframe(df, hide_index=True)
-    st.markdown("#### 📈 Graphiques")
+    st.dataframe(df[COLS_PERF], hide_index=True)
     colonnes = st.columns(3)
     for col, nom in zip(colonnes, ["Temps total (s)", "TTFT (s)", "Vitesse (tok/s)"]):
         col.caption(nom)
         col.bar_chart(df.set_index("Modèle")[nom])
+
+    st.markdown("#### 🖥️ Ressources matérielles pendant la génération")
+    st.dataframe(df[COLS_RES], hide_index=True)
+    graphes = ["CPU moy. (%)", "Mémoire du modèle (Mo)"]
+    if df["GPU moy. (%)"].notna().any():
+        graphes.append("GPU moy. (%)")
+    for col, nom in zip(st.columns(len(graphes)), graphes):
+        col.caption(nom)
+        col.bar_chart(df.set_index("Modèle")[nom])
+
+
+# ───────── AMÉLIORATION 4 : panneau de surveillance (barre latérale) ─────────
+def panneau_ressources():
+    """Instantané CPU / RAM / GPU et modèles chargés en mémoire."""
+    s = snapshot()
+    st.sidebar.progress(min(s["cpu"] / 100, 1.0), text=f"CPU : {s['cpu']:.0f} %")
+    st.sidebar.progress(min(s["ram_pct"] / 100, 1.0),
+                        text=f"RAM : {s['ram_used_gb']:.1f} / {s['ram_total_gb']:.1f} Go")
+    g = s["gpu"]
+    if g:
+        st.sidebar.progress(min(g["util"] / 100, 1.0), text=f"GPU : {g['util']:.0f} %")
+        st.sidebar.progress(min(g["mem_used"] / g["mem_total"], 1.0),
+                            text=f"Mémoire GPU : {g['mem_used']:.0f} / {g['mem_total']:.0f} Mo")
+    else:
+        st.sidebar.caption("GPU NVIDIA non détecté : mesures GPU indisponibles.")
+    if s["modeles"]:
+        for nom, taille, vram in s["modeles"]:
+            st.sidebar.caption(f"Modèle chargé : {nom} — {taille} Mo (dont GPU : {vram} Mo)")
+    else:
+        st.sidebar.caption("Aucun modèle chargé en mémoire.")
+
+
+@st.cache_data
+def infos_materiel():
+    return hardware_info()
 
 
 # ───────── AMÉLIORATION 1 : gestion des conversations ─────────
@@ -183,7 +247,9 @@ def page_conversation(options):
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            full_response, metriques = generer(selected_model, conv["messages"], options, message_placeholder)
+            zone_res = st.empty()
+            full_response, metriques = generer(selected_model, conv["messages"], options,
+                                               message_placeholder, zone_res)
             st.caption(legende_metriques(metriques))
 
         conv["messages"].append({"role": "assistant", "content": full_response,
@@ -235,7 +301,9 @@ def page_comparaison(options):
             with col:
                 st.markdown(f"### {modele}")
                 placeholder = st.empty()
-                reponses[modele], metriques[modele] = generer(modele, messages, options, placeholder)
+                zone_res = st.empty()
+                reponses[modele], metriques[modele] = generer(modele, messages, options,
+                                                              placeholder, zone_res)
                 st.caption(legende_metriques(metriques[modele]))
                 enregistrer_mesure("Comparaison", question, metriques[modele])
         st.session_state.derniere_comparaison = {
@@ -286,6 +354,15 @@ max_tokens = st.sidebar.slider("Nombre maximal de tokens", min_value=1, max_valu
 seed = st.sidebar.number_input("Seed (reproductibilité)", value=42, step=1)
 
 # --- Fin des options de configuration ---
+
+# --- Surveillance des ressources (Amélioration 4) ---
+st.sidebar.divider()
+if st.sidebar.toggle("📈 Surveiller les ressources"):
+    panneau_ressources()
+    st.sidebar.button("🔄 Actualiser")
+with st.sidebar.expander("🖥️ Matériel (pour le rapport)"):
+    for cle, valeur in infos_materiel().items():
+        st.write(f"**{cle}** : {valeur}")
 
 options = {
     'temperature': temperature,
