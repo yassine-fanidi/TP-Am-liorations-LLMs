@@ -1,7 +1,9 @@
 import json
+import time
 import uuid
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 import ollama
 
@@ -13,20 +15,87 @@ MODE_COMP = "⚖️ Comparaison des modèles"
 available_models = ["llama3.2", "qwen:0.5b"]  # Liste des modèles disponibles
 
 
-# ───────── Génération en streaming (boucle du code initial, mise en fonction) ─────────
+# ───────── AMÉLIORATION 3 : génération en streaming avec mesure des performances ─────────
+def lire(obj, cle, defaut=None):
+    """Lit un champ d'une réponse Ollama (dict ou objet selon la version de la bibliothèque)."""
+    if obj is None:
+        return defaut
+    if isinstance(obj, dict):
+        return obj.get(cle, defaut)
+    return getattr(obj, cle, defaut)
+
+
 def generer(modele, messages, options, message_placeholder):
-    """Appelle le modèle en streaming, affiche la réponse au fil de l'eau et la retourne."""
-    full_response = ""
+    """Appelle le modèle en streaming, affiche la réponse au fil de l'eau.
+
+    Retourne (réponse, métriques).
+    """
+    full_response, ttft, final, nb_morceaux = "", None, None, 0
+
+    debut = time.perf_counter()
     for response in ollama.chat(
         model=modele,
         messages=[{'role': m['role'], 'content': m['content']} for m in messages],
         options=options,
         stream=True
     ):
-        full_response += response['message']['content']
-        message_placeholder.markdown(full_response + "▌")
+        texte = lire(lire(response, 'message'), 'content', '') or ''
+        if texte:
+            nb_morceaux += 1
+            if ttft is None:
+                ttft = time.perf_counter() - debut      # temps jusqu'au 1er token
+            full_response += texte
+            message_placeholder.markdown(full_response + "▌")
+        if lire(response, 'done'):
+            final = response                             # dernier message : contient les statistiques
+    duree = time.perf_counter() - debut
     message_placeholder.markdown(full_response)
-    return full_response
+
+    tokens = lire(final, 'eval_count') or nb_morceaux
+    duree_gen_ns = lire(final, 'eval_duration') or 0
+    charge_ns = lire(final, 'load_duration') or 0
+    # vitesse de génération = tokens / durée de génération mesurée par Ollama
+    vitesse = tokens / (duree_gen_ns / 1e9) if duree_gen_ns else (tokens / duree if duree else 0.0)
+    raison = lire(final, 'done_reason')
+
+    metriques = {
+        "Modèle": modele,
+        "Temps total (s)": round(duree, 3),
+        "TTFT (s)": None if ttft is None else round(ttft, 3),
+        "Tokens générés": int(tokens),
+        "Vitesse (tok/s)": round(vitesse, 2),
+        "Chargement modèle (s)": round(charge_ns / 1e9, 3),
+        "Fin de génération": "tronquée (limite de tokens)" if raison == "length" else "terminée",
+    }
+    return full_response, metriques
+
+
+def fmt(x, spec="{:.1f}"):
+    return "–" if x is None else spec.format(x)
+
+
+def legende_metriques(m):
+    """Ligne de mesures affichée sous une réponse."""
+    fin = " · ⚠️ tronquée" if m["Fin de génération"].startswith("tronquée") else ""
+    return (f"⏱️ {fmt(m['Temps total (s)'])} s · TTFT {fmt(m['TTFT (s)'], '{:.2f}')} s · "
+            f"{m['Tokens générés']} tokens · {fmt(m['Vitesse (tok/s)'])} tok/s{fin}")
+
+
+def enregistrer_mesure(mode, question, metriques):
+    """Garde toutes les mesures de la session (historique et export CSV)."""
+    st.session_state.mesures.append({"Mode": mode, "Question": question[:40], **metriques})
+
+
+def afficher_metriques(liste_metriques):
+    """Tableau comparatif + graphiques."""
+    df = pd.DataFrame(liste_metriques)
+    st.markdown("#### 📊 Tableau comparatif des performances")
+    st.dataframe(df, hide_index=True)
+    st.markdown("#### 📈 Graphiques")
+    colonnes = st.columns(3)
+    for col, nom in zip(colonnes, ["Temps total (s)", "TTFT (s)", "Vitesse (tok/s)"]):
+        col.caption(nom)
+        col.bar_chart(df.set_index("Modèle")[nom])
 
 
 # ───────── AMÉLIORATION 1 : gestion des conversations ─────────
@@ -46,7 +115,10 @@ def vers_txt(conv):
     lignes = [f"Conversation : {conv['titre']}", f"Créée le : {conv['creee_le']}", "=" * 50, ""]
     for m in conv["messages"]:
         auteur = "Utilisateur" if m["role"] == "user" else "Assistant"
-        lignes += [f"[{auteur}]", m["content"], ""]
+        lignes += [f"[{auteur}]", m["content"]]
+        if m.get("metriques"):
+            lignes.append(f"({legende_metriques(m['metriques'])})")
+        lignes.append("")
     return "\n".join(lignes)
 
 
@@ -97,6 +169,8 @@ def page_conversation(options):
     for message in conv["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message.get("metriques"):
+                st.caption(f"{message['modele']} — {legende_metriques(message['metriques'])}")
 
     # Accepter l'entrée de l'utilisateur
     prompt = st.chat_input("Que voulez-vous me demander ?")
@@ -109,9 +183,12 @@ def page_conversation(options):
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            full_response = generer(selected_model, conv["messages"], options, message_placeholder)
+            full_response, metriques = generer(selected_model, conv["messages"], options, message_placeholder)
+            st.caption(legende_metriques(metriques))
 
-        conv["messages"].append({"role": "assistant", "content": full_response})
+        conv["messages"].append({"role": "assistant", "content": full_response,
+                                 "modele": selected_model, "metriques": metriques})
+        enregistrer_mesure("Conversation", prompt, metriques)
 
         if premier_message:
             conv["titre"] = prompt[:40] + ("…" if len(prompt) > 40 else "")
@@ -120,12 +197,14 @@ def page_conversation(options):
 
 # ───────── AMÉLIORATION 2 : comparaison de deux modèles ─────────
 def afficher_comparaison(d):
-    """Affiche les deux réponses côte à côte."""
+    """Affiche les deux réponses côte à côte, puis le tableau et les graphiques."""
     colonnes = st.columns(2)
     for col, m in zip(colonnes, d["modeles"]):
         with col:
             st.markdown(f"### {m}")
             st.markdown(d["reponses"][m])
+            st.caption(legende_metriques(d["metriques"][m]))
+    afficher_metriques([d["metriques"][m] for m in d["modeles"]])
 
 
 def page_comparaison(options):
@@ -151,25 +230,39 @@ def page_comparaison(options):
         # 3. Même question, mêmes paramètres, pour les deux modèles (l'un après l'autre)
         messages = [{"role": "user", "content": question}]
         colonnes = st.columns(2)  # 4. Réponses côte à côte
-        reponses = {}
+        reponses, metriques = {}, {}
         for col, modele in zip(colonnes, (modele_a, modele_b)):
             with col:
                 st.markdown(f"### {modele}")
                 placeholder = st.empty()
-                reponses[modele] = generer(modele, messages, options, placeholder)
+                reponses[modele], metriques[modele] = generer(modele, messages, options, placeholder)
+                st.caption(legende_metriques(metriques[modele]))
+                enregistrer_mesure("Comparaison", question, metriques[modele])
         st.session_state.derniere_comparaison = {
-            "question": question, "modeles": (modele_a, modele_b), "reponses": reponses,
+            "question": question, "modeles": (modele_a, modele_b),
+            "reponses": reponses, "metriques": metriques,
         }
+        afficher_metriques([metriques[m] for m in (modele_a, modele_b)])
     elif st.session_state.get("derniere_comparaison"):
         d = st.session_state.derniere_comparaison
         st.info(f"Dernière comparaison : « {d['question'][:80]} »")
         afficher_comparaison(d)
+
+    # Historique de toutes les mesures de la session (export CSV)
+    if st.session_state.mesures:
+        with st.expander(f"📜 Historique de toutes les mesures ({len(st.session_state.mesures)})"):
+            df = pd.DataFrame(st.session_state.mesures)
+            st.dataframe(df, hide_index=True)
+            st.download_button("⬇️ Exporter en CSV", df.to_csv(index=False),
+                               file_name="mesures_session.csv", mime="text/csv")
 
 
 # ───────── Programme principal ─────────
 if "conversations" not in st.session_state:
     st.session_state.conversations = {}
     nouvelle_conversation()
+if "mesures" not in st.session_state:
+    st.session_state.mesures = []
 
 # Choix du mode
 mode = st.sidebar.radio("Mode", [MODE_CONV, MODE_COMP])
