@@ -14,7 +14,7 @@ st.title("ENSET Chatbot")
 
 MODE_CONV = "💬 Conversation"
 MODE_COMP = "⚖️ Comparaison des modèles"
-available_models = ["llama3.2", "qwen:0.5b"]  # Liste des modèles disponibles
+available_models = []  # rempli au démarrage par la détection des modèles réellement installés
 
 COLS_PERF = ["Modèle", "Temps total (s)", "TTFT (s)", "Tokens générés", "Vitesse (tok/s)",
              "Chargement modèle (s)", "Fin de génération"]
@@ -30,6 +30,34 @@ def lire(obj, cle, defaut=None):
     if isinstance(obj, dict):
         return obj.get(cle, defaut)
     return getattr(obj, cle, defaut)
+
+
+# ───────── AMÉLIORATION 5 : robustesse ─────────
+def verifier_ollama():
+    """Interroge Ollama. Retourne (service_accessible, modèles_installés, message_erreur)."""
+    try:
+        reponse = ollama.list()
+        noms = []
+        for m in lire(reponse, "models", []) or []:
+            nom = lire(m, "model") or lire(m, "name")
+            if nom:
+                noms.append(nom)
+        return True, sorted(noms), ""
+    except Exception as e:
+        return False, [], str(e)
+
+
+def message_erreur(e, modele):
+    """Transforme une exception en message explicite pour l'utilisateur."""
+    if isinstance(e, ollama.ResponseError):
+        if getattr(e, "status_code", None) == 404:
+            return (f"Le modèle « {modele} » n'est pas installé. "
+                    f"Installez-le avec la commande : `ollama pull {modele}`")
+        return f"Ollama a renvoyé une erreur : {e}"
+    if isinstance(e, OSError) or "connect" in str(e).lower():
+        return ("Le service Ollama est inaccessible (il a peut-être été arrêté pendant la génération). "
+                "Relancez l'application Ollama ou la commande `ollama serve`, puis réessayez.")
+    return f"Erreur inattendue pendant la génération : {e}"
 
 
 def generer(modele, messages, options, message_placeholder, zone_res=None):
@@ -245,20 +273,31 @@ def page_conversation(options):
             st.markdown(prompt)
         conv["messages"].append({"role": "user", "content": prompt})
 
+        succes = False
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             zone_res = st.empty()
-            full_response, metriques = generer(selected_model, conv["messages"], options,
-                                               message_placeholder, zone_res)
-            st.caption(legende_metriques(metriques))
+            try:
+                # Indicateur visuel : génération en cours
+                with st.spinner(f"⏳ {selected_model} génère une réponse…"):
+                    full_response, metriques = generer(selected_model, conv["messages"], options,
+                                                       message_placeholder, zone_res)
+                st.caption(legende_metriques(metriques))
+                succes = True
+            except Exception as e:
+                message_placeholder.empty()
+                zone_res.empty()
+                st.error(f"❌ {message_erreur(e, selected_model)}")
 
-        conv["messages"].append({"role": "assistant", "content": full_response,
-                                 "modele": selected_model, "metriques": metriques})
-        enregistrer_mesure("Conversation", prompt, metriques)
-
-        if premier_message:
-            conv["titre"] = prompt[:40] + ("…" if len(prompt) > 40 else "")
-            st.rerun()  # rafraîchit le titre dans la barre latérale
+        if succes:
+            conv["messages"].append({"role": "assistant", "content": full_response,
+                                     "modele": selected_model, "metriques": metriques})
+            enregistrer_mesure("Conversation", prompt, metriques)
+            if premier_message:
+                conv["titre"] = prompt[:40] + ("…" if len(prompt) > 40 else "")
+                st.rerun()  # rafraîchit le titre dans la barre latérale
+        else:
+            conv["messages"].pop()  # on retire la question restée sans réponse
 
 
 # ───────── AMÉLIORATION 2 : comparaison de deux modèles ─────────
@@ -268,9 +307,14 @@ def afficher_comparaison(d):
     for col, m in zip(colonnes, d["modeles"]):
         with col:
             st.markdown(f"### {m}")
-            st.markdown(d["reponses"][m])
-            st.caption(legende_metriques(d["metriques"][m]))
-    afficher_metriques([d["metriques"][m] for m in d["modeles"]])
+            if m in d["erreurs"]:
+                st.error(f"❌ {d['erreurs'][m]}")
+            else:
+                st.markdown(d["reponses"][m])
+                st.caption(legende_metriques(d["metriques"][m]))
+    ok = [d["metriques"][m] for m in d["modeles"] if m in d["metriques"]]
+    if ok:
+        afficher_metriques(ok)
 
 
 def page_comparaison(options):
@@ -282,11 +326,14 @@ def page_comparaison(options):
     # 1. Question unique
     question = st.text_area("Question", height=100, placeholder="Saisissez une question unique…")
 
-    # 2. Sélection de deux modèles
+    # 2. Sélection de deux modèles parmi ceux installés
     c1, c2 = st.columns(2)
     modele_a = c1.selectbox("Modèle A", available_models, index=0, key="cmp_a")
-    modele_b = c2.selectbox("Modèle B", available_models, index=1, key="cmp_b")
-    if modele_a == modele_b:
+    modele_b = c2.selectbox("Modèle B", available_models, index=min(1, len(available_models) - 1), key="cmp_b")
+    if len(available_models) < 2:
+        st.warning("Un seul modèle est installé : installez-en un second "
+                   "(par exemple `ollama pull qwen:0.5b`) pour pouvoir comparer.")
+    elif modele_a == modele_b:
         st.warning("Choisissez deux modèles différents.")
 
     lancer = st.button("▶️ Comparer", type="primary",
@@ -296,21 +343,30 @@ def page_comparaison(options):
         # 3. Même question, mêmes paramètres, pour les deux modèles (l'un après l'autre)
         messages = [{"role": "user", "content": question}]
         colonnes = st.columns(2)  # 4. Réponses côte à côte
-        reponses, metriques = {}, {}
+        reponses, metriques, erreurs = {}, {}, {}
         for col, modele in zip(colonnes, (modele_a, modele_b)):
             with col:
                 st.markdown(f"### {modele}")
                 placeholder = st.empty()
                 zone_res = st.empty()
-                reponses[modele], metriques[modele] = generer(modele, messages, options,
-                                                              placeholder, zone_res)
-                st.caption(legende_metriques(metriques[modele]))
-                enregistrer_mesure("Comparaison", question, metriques[modele])
+                try:
+                    with st.spinner(f"⏳ {modele} génère une réponse…"):
+                        reponses[modele], metriques[modele] = generer(modele, messages, options,
+                                                                      placeholder, zone_res)
+                    st.caption(legende_metriques(metriques[modele]))
+                    enregistrer_mesure("Comparaison", question, metriques[modele])
+                except Exception as e:
+                    placeholder.empty()
+                    zone_res.empty()
+                    erreurs[modele] = message_erreur(e, modele)
+                    st.error(f"❌ {erreurs[modele]}")
         st.session_state.derniere_comparaison = {
             "question": question, "modeles": (modele_a, modele_b),
-            "reponses": reponses, "metriques": metriques,
+            "reponses": reponses, "metriques": metriques, "erreurs": erreurs,
         }
-        afficher_metriques([metriques[m] for m in (modele_a, modele_b)])
+        ok = [metriques[m] for m in (modele_a, modele_b) if m in metriques]
+        if ok:
+            afficher_metriques(ok)
     elif st.session_state.get("derniere_comparaison"):
         d = st.session_state.derniere_comparaison
         st.info(f"Dernière comparaison : « {d['question'][:80]} »")
@@ -332,7 +388,23 @@ if "conversations" not in st.session_state:
 if "mesures" not in st.session_state:
     st.session_state.mesures = []
 
-# Choix du mode
+# Détection du service Ollama et des modèles réellement installés
+service_ok, available_models, erreur_service = verifier_ollama()
+if not service_ok:
+    st.error("⚠️ Le service Ollama est inaccessible. Lancez l'application Ollama "
+             "(ou la commande `ollama serve`), puis cliquez sur « Réessayer ».")
+    st.code(erreur_service)
+    st.button("🔄 Réessayer")
+    st.stop()
+if not available_models:
+    st.warning("Ollama fonctionne, mais aucun modèle n'est installé. Exécutez par exemple "
+               "`ollama pull llama3.2` et `ollama pull qwen:0.5b`, puis rechargez la page.")
+    st.button("🔄 Recharger")
+    st.stop()
+
+st.sidebar.success(f"Ollama connecté · {len(available_models)} modèle(s) installé(s)")
+
+# Choix du mode : conversation ou comparaison
 mode = st.sidebar.radio("Mode", [MODE_CONV, MODE_COMP])
 
 # --- Options de configuration (code initial) ---
